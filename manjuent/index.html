@@ -8353,6 +8353,42 @@
           </div>
         </div>
         <div class="backup-stat-card">
+          <div class="backup-stat-header">
+            <div
+              class="backup-stat-header-icon"
+              style="background: var(--accent-soft)"
+            >
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="var(--accent)"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M3 6h18M6 6v12a2 2 0 002 2h8a2 2 0 002-2V6" />
+                <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" />
+                <path d="M10 11v6M14 11v6" />
+              </svg>
+            </div>
+            <div class="backup-stat-header-title">Clean Up Duplicates</div>
+          </div>
+          <div style="padding: 14px 16px">
+            <div class="backup-warn">
+              Merges items/customers/transports that got duplicated by
+              earlier CSV imports. Items keep the highest rate found.
+            </div>
+            <button
+              class="backup-btn backup-btn-primary"
+              onclick="cleanupDuplicates()"
+            >
+              Merge Duplicates Now
+            </button>
+          </div>
+        </div>
+        <div class="backup-stat-card">
           <div
             class="backup-stat-header"
             style="border-bottom: 1px solid var(--danger-soft)"
@@ -8982,6 +9018,14 @@
         return (
           Date.now().toString(36) + Math.random().toString(36).substr(2, 5)
         );
+      }
+      // Normalizes a name for duplicate matching: trims, lowercases,
+      // collapses whitespace. Used by all CSV/Excel import + dedup logic.
+      function normName(s) {
+        return String(s || "")
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, " ");
       }
       function todayISO() {
         return new Date().toISOString().split("T")[0];
@@ -11269,20 +11313,30 @@
               showCustomerMappingUI(rows);
               return;
             }
-            let added = 0;
+            let added = 0,
+              updated = 0;
             const startRow =
               rows[0] && rows[0][0] && isNaN(parseFloat(rows[0][0])) ? 1 : 0;
             rows.slice(startRow).forEach((r) => {
               if (!r[0] || !String(r[0]).trim()) return;
-              S.transports.push({
-                id: uid(),
-                name: String(r[0]).trim(),
-                contact: String(r[1] || "").trim(),
-              });
-              added++;
+              const name = String(r[0]).trim();
+              const contact = String(r[1] || "").trim();
+              const existing = S.transports.find(
+                (t) => normName(t.name) === normName(name),
+              );
+              if (existing) {
+                existing.name = name;
+                if (contact) existing.contact = contact;
+                updated++;
+              } else {
+                S.transports.push({ id: uid(), name, contact });
+                added++;
+              }
             });
             persist("transports");
-            showToast(added + " records imported");
+            showToast(
+              added + " added" + (updated ? ", " + updated + " updated" : ""),
+            );
             switchSeg("trans", "list");
           } catch (err) {
             showToast("Import error: " + err.message);
@@ -11458,6 +11512,7 @@
           return;
         }
         let added = 0,
+          updated = 0,
           skipped = 0;
         _importRows.slice(dataStart).forEach((row) => {
           const name = String(row[ni] || "").trim();
@@ -11470,31 +11525,54 @@
           const searchName =
             rawSearchName ||
             (name && location ? name + " - " + location : name);
-          S.customers.push({
-            id: uid(),
-            name,
-            location,
-            phone: pi >= 0 ? String(row[pi] || "").trim() : "",
-            preferredTransport: ti >= 0 ? String(row[ti] || "").trim() : "",
-            searchName,
-          });
+          const phone = pi >= 0 ? String(row[pi] || "").trim() : "";
           const tName = ti >= 0 ? String(row[ti] || "").trim() : "";
+
+          // Match existing customer: prefer name+location, fall back to
+          // name-only when this row has no location, so we update rather
+          // than create a duplicate for the same party.
+          const nKey = normName(name);
+          let existing = S.customers.find(
+            (c) => normName(c.name) === nKey && normName(c.location) === normName(location),
+          );
+          if (!existing && !location) {
+            existing = S.customers.find((c) => normName(c.name) === nKey);
+          }
+
+          if (existing) {
+            existing.name = name;
+            if (li >= 0) existing.location = location;
+            if (si >= 0) existing.searchName = searchName;
+            if (pi >= 0 && phone) existing.phone = phone;
+            if (ti >= 0 && tName) existing.preferredTransport = tName;
+            updated++;
+          } else {
+            S.customers.push({
+              id: uid(),
+              name,
+              location,
+              phone,
+              preferredTransport: tName,
+              searchName,
+            });
+            added++;
+          }
+
           if (
             tName &&
-            !S.transports.some(
-              (t) => t.name.toLowerCase() === tName.toLowerCase(),
-            )
+            !S.transports.some((t) => normName(t.name) === normName(tName))
           ) {
             S.transports.push({ id: uid(), name: tName, contact: "" });
           }
-          added++;
         });
         persist("customers");
         persist("transports");
         document.getElementById("edit-overlay").classList.remove("show");
         showToast(
           added +
-            " customers imported" +
+            " added, " +
+            updated +
+            " updated" +
             (skipped ? " (" + skipped + " skipped)" : ""),
         );
         switchSeg("cust", "list");
@@ -11553,6 +11631,7 @@
         const ri = parseInt(document.getElementById("map-rate").value);
         const ui = parseInt(document.getElementById("map-unit").value);
         let added = 0,
+          updated = 0,
           skipped = 0;
         _importRows.slice(dataStart).forEach((row) => {
           const name = String(row[ni] || "").trim();
@@ -11562,19 +11641,33 @@
             return;
           }
           const rawUnit = ui >= 0 ? String(row[ui] || "").toLowerCase() : "";
-          S.products.push({
-            id: uid(),
-            name,
-            type: rawUnit.match(/kg/) ? "kg" : "pc",
-            rate,
-          });
-          added++;
+          // null = unit column wasn't mapped -> don't clobber an existing
+          // item's unit on update; new items still default to "pc" below.
+          const type = ui >= 0 ? (rawUnit.match(/kg/) ? "kg" : "pc") : null;
+          const key = normName(name);
+          const existing = S.products.find((p) => normName(p.name) === key);
+          if (existing) {
+            existing.name = name;
+            existing.rate = rate;
+            if (type) existing.type = type;
+            updated++;
+          } else {
+            S.products.push({
+              id: uid(),
+              name,
+              type: type || "pc",
+              rate,
+            });
+            added++;
+          }
         });
         persist("products");
         document.getElementById("edit-overlay").classList.remove("show");
         showToast(
           added +
-            " items imported" +
+            " added, " +
+            updated +
+            " updated" +
             (skipped ? " (" + skipped + " skipped)" : ""),
         );
         switchSeg("prod", "list");
@@ -11660,6 +11753,144 @@
         reader.readAsText(file);
         event.target.value = "";
       }
+      // ================================================================
+      // ONE-TIME CLEANUP for duplicates created by earlier buggy imports.
+      // Products: for each duplicate name, keep the copy with the HIGHEST
+      //   rate (per user's rule) and merge it into the survivor's id.
+      // Customers: for each duplicate name+location, keep the most
+      //   complete record (most non-empty fields), preferring the newest.
+      // Transports: merge duplicate names, keeping any non-empty contact.
+      // Any bill line items pointing at a removed product id are re-linked
+      // to the surviving product id so historic bills stay intact.
+      // ================================================================
+      function cleanupDuplicates() {
+        if (
+          !confirm(
+            "Scan for duplicate items, customers & transports and merge them?\n\nFor items, the copy with the HIGHEST rate is kept. This cannot be undone (export a backup first if unsure).",
+          )
+        )
+          return;
+
+        let prodRemoved = 0,
+          custRemoved = 0,
+          transRemoved = 0;
+
+        // --- Products: keep highest rate ---
+        {
+          const groups = new Map();
+          S.products.forEach((p) => {
+            const key = normName(p.name);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(p);
+          });
+          const idRemap = {}; // removedId -> keptId
+          const kept = [];
+          groups.forEach((list) => {
+            if (list.length === 1) {
+              kept.push(list[0]);
+              return;
+            }
+            let survivor = list[0];
+            for (let i = 1; i < list.length; i++) {
+              if ((list[i].rate || 0) > (survivor.rate || 0)) survivor = list[i];
+            }
+            list.forEach((p) => {
+              if (p !== survivor) {
+                idRemap[p.id] = survivor.id;
+                prodRemoved++;
+              }
+            });
+            kept.push(survivor);
+          });
+          S.products = kept;
+          if (prodRemoved) {
+            // Re-link historic bill line items so old bills keep working.
+            S.bills.forEach((b) => {
+              (b.items || []).forEach((it) => {
+                if (it.productId && idRemap[it.productId]) {
+                  it.productId = idRemap[it.productId];
+                }
+              });
+            });
+            S.billItems.forEach((it) => {
+              if (it.productId && idRemap[it.productId]) {
+                it.productId = idRemap[it.productId];
+              }
+            });
+          }
+        }
+
+        // --- Customers: keep the most complete record ---
+        {
+          const groups = new Map();
+          S.customers.forEach((c) => {
+            const key = normName(c.name) + "|" + normName(c.location);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(c);
+          });
+          const completeness = (c) =>
+            (c.location ? 1 : 0) +
+            (c.phone ? 1 : 0) +
+            (c.preferredTransport ? 1 : 0) +
+            (c.searchName ? 1 : 0);
+          const kept = [];
+          groups.forEach((list) => {
+            if (list.length === 1) {
+              kept.push(list[0]);
+              return;
+            }
+            let survivor = list[0];
+            for (let i = 1; i < list.length; i++) {
+              if (completeness(list[i]) >= completeness(survivor))
+                survivor = list[i];
+            }
+            custRemoved += list.length - 1;
+            kept.push(survivor);
+          });
+          S.customers = kept;
+        }
+
+        // --- Transports: merge duplicate names ---
+        {
+          const groups = new Map();
+          S.transports.forEach((t) => {
+            const key = normName(t.name);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(t);
+          });
+          const kept = [];
+          groups.forEach((list) => {
+            if (list.length === 1) {
+              kept.push(list[0]);
+              return;
+            }
+            const survivor = { ...list[0] };
+            list.forEach((t) => {
+              if (t.contact) survivor.contact = t.contact;
+            });
+            transRemoved += list.length - 1;
+            kept.push(survivor);
+          });
+          S.transports = kept;
+        }
+
+        persist("products");
+        persist("customers");
+        persist("transports");
+        if (prodRemoved) persist("bills");
+        updateBackupScreen();
+        updateGatewayCounts();
+        showToast(
+          "Merged " +
+            prodRemoved +
+            " items, " +
+            custRemoved +
+            " customers, " +
+            transRemoved +
+            " transports",
+        );
+      }
+
       function clearAllData() {
         if (!confirm("Delete ALL data? Cannot be undone!")) return;
         if (!confirm("Final confirmation: tap OK to delete everything."))
